@@ -681,22 +681,20 @@ local function restorePerformance()
 end
 
 --------------------------------------------------
--- CLEAN OLD UI
+-- CLEAN OLD UI (SAFE ACROSS COMMON GUI CONTAINERS)
 --------------------------------------------------
--- Clean previous copies from every UI container we can safely access.
-local function destroyOldGui(parent)
-    if not parent then return end
+local CoreGui = game:GetService("CoreGui")
+
+local function destroyOldGui(container)
+    if not container then return end
     pcall(function()
-        local old = parent:FindFirstChild(APP_NAME)
+        local old = container:FindFirstChild(APP_NAME)
         if old then old:Destroy() end
     end)
 end
 
 destroyOldGui(PlayerGui)
-
-local CoreGui = game:GetService("CoreGui")
 destroyOldGui(CoreGui)
-
 pcall(function()
     if typeof(gethui) == "function" then
         destroyOldGui(gethui())
@@ -768,6 +766,8 @@ end
 
 --------------------------------------------------
 -- ROOT / BACKDROP
+-- Loadstring-safe parenting. The GUI always falls back to PlayerGui
+-- instead of killing the whole script if hidden/CoreGui parenting fails.
 --------------------------------------------------
 local gui = Instance.new("ScreenGui")
 gui.Name = APP_NAME
@@ -776,8 +776,6 @@ gui.IgnoreGuiInset = true
 gui.DisplayOrder = 2147483647
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
 
--- Optional newer ScreenGui properties. They are wrapped so older runtimes
--- cannot stop the entire script from loading.
 pcall(function()
     gui.ScreenInsets = Enum.ScreenInsets.None
 end)
@@ -786,57 +784,48 @@ pcall(function()
     gui.ClipToDeviceSafeArea = false
 end)
 
--- Protect the GUI when the runtime exposes a Synapse-style helper.
-pcall(function()
-    if syn and syn.protect_gui then
-        syn.protect_gui(gui)
-    end
-end)
-
--- Some runtimes expose this hidden property. Failure here is harmless.
+-- Some runtimes expose this hidden property for drawing above CoreGui blur.
 pcall(function()
     if typeof(sethiddenproperty) == "function" then
         sethiddenproperty(gui, "OnTopOfCoreBlur", true)
     end
 end)
 
--- Try hidden UI first. If the runtime refuses that parent, try CoreGui.
--- If CoreGui is also blocked, fall back to PlayerGui so the panel still loads.
-local parentCandidates = {}
+-- Protect first when supported, but never require it.
+pcall(function()
+    if syn and syn.protect_gui then
+        syn.protect_gui(gui)
+    end
+end)
 
+local parented = false
+
+-- 1) hidden UI container, when supported
 pcall(function()
     if typeof(gethui) == "function" then
         local hidden = gethui()
         if hidden then
-            parentCandidates[#parentCandidates + 1] = hidden
+            gui.Parent = hidden
+            parented = (gui.Parent == hidden)
         end
     end
 end)
 
-parentCandidates[#parentCandidates + 1] = CoreGui
-parentCandidates[#parentCandidates + 1] = PlayerGui
-
-local parented = false
-local parentName = "none"
-
-for _, candidate in ipairs(parentCandidates) do
-    if not parented and candidate then
-        local ok = pcall(function()
-            gui.Parent = candidate
-        end)
-
-        if ok and gui.Parent == candidate then
-            parented = true
-            parentName = candidate:GetFullName()
-        end
-    end
-end
-
+-- 2) CoreGui
 if not parented then
-    error("OP1 UI could not be parented to gethui, CoreGui, or PlayerGui")
+    pcall(function()
+        gui.Parent = CoreGui
+        parented = (gui.Parent == CoreGui)
+    end)
 end
 
-print("[OP1] GUI parent: " .. parentName)
+-- 3) Guaranteed normal fallback
+if not parented then
+    gui.Parent = PlayerGui
+    parented = true
+end
+
+print("[OP1] GUI parent:", gui.Parent:GetFullName())
 
 local shadow = Instance.new("Frame")
 shadow.Name = "Shadow"
@@ -846,7 +835,6 @@ shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
 shadow.BackgroundTransparency = 0.47
 shadow.BorderSizePixel = 0
 shadow.Parent = gui
-shadow.ZIndex = 999998
 round(shadow, 23)
 
 local main = Instance.new("Frame")
@@ -857,7 +845,6 @@ main.BackgroundColor3 = COLORS.panel
 main.BorderSizePixel = 0
 main.ClipsDescendants = true
 main.Parent = gui
-main.ZIndex = 999999
 round(main, 20)
 stroke(main, Color3.fromRGB(56, 66, 84), 1, 0.25)
 gradient(main, Color3.fromRGB(16, 19, 27), Color3.fromRGB(10, 12, 17), 90)
@@ -1815,30 +1802,6 @@ track(Lighting.DescendantAdded:Connect(function(obj)
         if PERF.Atmosphere then stripAtmosObject(obj) end
     end)
 end))
-
---------------------------------------------------
--- FORCE HIGH GUI Z-ORDER
---------------------------------------------------
--- Roblox's own menu is a CoreGui layer. These values keep every object in this
--- panel at the highest normal GUI order available to the runtime. The hidden
--- OnTopOfCoreBlur property above is what may allow it to remain above ESC blur
--- on executor environments that support that behavior.
-local function boostGuiZIndex(root, base)
-    for _, obj in ipairs(root:GetDescendants()) do
-        if obj:IsA("GuiObject") then
-            local oldZ = obj.ZIndex
-            pcall(function()
-                obj.ZIndex = base + math.clamp(oldZ, 0, 999)
-            end)
-        end
-    end
-end
-
-pcall(function()
-    shadow.ZIndex = 999998
-    main.ZIndex = 999999
-    boostGuiZIndex(main, 1000000)
-end)
 
 --------------------------------------------------
 -- FPS COUNTER
