@@ -1,1 +1,1896 @@
+--[[
+    OP1 ACCOUNT CHECKER + PERFORMANCE PANEL
+    ---------------------------------------
+    Scanner:
+      • Scan up to 8 usernames (comma/space separated)
+      • Scan current lobby
+      • Account age / friends / badge sample / groups / avatar asset count
+      • FPS/shooter badge keyword hits
+      • Risk score + Alt Likelihood score
+      • Manual Clean / Suspicious / Cheater tags
+      • Optional persistent DB if readfile/writefile/isfile are supported
 
+    Performance:
+      • FPS counter
+      • FPS cap toggle -> 9999 if setfpscap exists
+      • Potato mode
+      • Strip textures
+      • Simple materials
+      • Remove particles
+      • Remove shadows
+      • Remove post effects
+      • Remove atmosphere/clouds
+      • Restore visuals
+
+    UI:
+      • Modern dark panel
+      • Draggable
+      • RightShift hide/show
+      • Unload button
+
+    NOTE:
+      Scores are heuristics only. They are NOT proof of cheating.
+]]
+
+--------------------------------------------------
+-- SERVICES
+--------------------------------------------------
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+--------------------------------------------------
+-- GLOBAL STATE
+--------------------------------------------------
+local APP_NAME = "OP1MegaChecker"
+local DB_FILE = "OP1_AccountChecker_DB.json"
+local UNLOADED = false
+local CONNECTIONS = {}
+local DB = {}
+local ACTIVE_TAB = "Scanner"
+
+local COLORS = {
+    bg = Color3.fromRGB(12, 14, 18),
+    panel = Color3.fromRGB(18, 21, 27),
+    card = Color3.fromRGB(26, 30, 38),
+    cardHover = Color3.fromRGB(32, 37, 47),
+    stroke = Color3.fromRGB(48, 55, 68),
+    text = Color3.fromRGB(242, 245, 250),
+    sub = Color3.fromRGB(150, 160, 177),
+    green = Color3.fromRGB(75, 220, 140),
+    yellow = Color3.fromRGB(255, 190, 78),
+    orange = Color3.fromRGB(255, 142, 74),
+    red = Color3.fromRGB(255, 86, 96),
+    blue = Color3.fromRGB(91, 164, 255),
+    purple = Color3.fromRGB(170, 110, 255),
+}
+
+local function track(conn)
+    CONNECTIONS[#CONNECTIONS + 1] = conn
+    return conn
+end
+
+local function tw(obj, props, t)
+    TweenService:Create(
+        obj,
+        TweenInfo.new(t or 0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        props
+    ):Play()
+end
+
+local function round(obj, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 10)
+    c.Parent = obj
+    return c
+end
+
+local function stroke(obj, color, thickness, transparency)
+    local s = Instance.new("UIStroke")
+    s.Color = color or COLORS.stroke
+    s.Thickness = thickness or 1
+    s.Transparency = transparency or 0
+    s.Parent = obj
+    return s
+end
+
+local function clamp(n, lo, hi)
+    return math.max(lo, math.min(hi, n))
+end
+
+local function trim(s)
+    return (tostring(s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function safeLower(s)
+    return string.lower(tostring(s or ""))
+end
+
+--------------------------------------------------
+-- OPTIONAL LOCAL DB
+--------------------------------------------------
+local function loadDB()
+    if typeof(isfile) == "function" and typeof(readfile) == "function" then
+        local ok, exists = pcall(isfile, DB_FILE)
+        if ok and exists then
+            local ok2, raw = pcall(readfile, DB_FILE)
+            if ok2 and raw and raw ~= "" then
+                local ok3, decoded = pcall(function()
+                    return HttpService:JSONDecode(raw)
+                end)
+                if ok3 and type(decoded) == "table" then
+                    DB = decoded
+                end
+            end
+        end
+    end
+end
+
+local function saveDB()
+    if typeof(writefile) == "function" then
+        pcall(function()
+            writefile(DB_FILE, HttpService:JSONEncode(DB))
+        end)
+    end
+end
+
+loadDB()
+
+--------------------------------------------------
+-- HTTP HELPERS
+--------------------------------------------------
+local REQUEST = nil
+pcall(function()
+    if syn and syn.request then REQUEST = syn.request end
+end)
+if not REQUEST and typeof(http_request) == "function" then REQUEST = http_request end
+if not REQUEST and typeof(request) == "function" then REQUEST = request end
+
+local function rawGet(url)
+    if REQUEST then
+        local ok, response = pcall(function()
+            return REQUEST({
+                Url = url,
+                Method = "GET",
+                Headers = { ["User-Agent"] = "OP1Checker" }
+            })
+        end)
+        if ok and response then
+            local body = response.Body or response.body
+            local code = response.StatusCode or response.Status or response.status
+            if body and (not code or (code >= 200 and code < 300)) then
+                return body
+            end
+        end
+    end
+
+    local ok, body = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok then return body end
+    return nil
+end
+
+local function getJSON(url)
+    local body = rawGet(url)
+    if not body then return nil end
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(body)
+    end)
+    if ok then return decoded end
+    return nil
+end
+
+--------------------------------------------------
+-- ACCOUNT DATA
+--------------------------------------------------
+local FPS_KEYWORDS = {
+    "arsenal", "phantom forces", "frontlines", "bad business", "counter blox",
+    "aimblox", "rivals", "operation one", "deadline", "rolling thunder",
+    "gunfight", "headshot", "marksman", "sniper", "shooter", "fps",
+    "firearm", "weapon", "killstreak", "elimination"
+}
+
+local function containsFPSKeyword(text)
+    text = safeLower(text)
+    for _, keyword in ipairs(FPS_KEYWORDS) do
+        if string.find(text, keyword, 1, true) then
+            return keyword
+        end
+    end
+    return nil
+end
+
+local function isoToUnix(iso)
+    if not iso or iso == "" then return nil end
+    local ok, dt = pcall(function()
+        return DateTime.fromIsoDate(iso)
+    end)
+    if ok and dt then return dt.UnixTimestamp end
+    return nil
+end
+
+local function ageDaysFromCreated(created)
+    local unix = isoToUnix(created)
+    if not unix then return nil end
+    return math.max(0, math.floor((DateTime.now().UnixTimestamp - unix) / 86400))
+end
+
+local function getUserIdFromUsername(username)
+    local ok, id = pcall(function()
+        return Players:GetUserIdFromNameAsync(username)
+    end)
+    if ok then return id end
+    return nil
+end
+
+local function getUserInfo(userId)
+    return getJSON("https://users.roblox.com/v1/users/" .. tostring(userId))
+end
+
+local function getFriendCount(userId)
+    local data = getJSON("https://friends.roblox.com/v1/users/" .. tostring(userId) .. "/friends/count")
+    return data and tonumber(data.count) or nil
+end
+
+local function getCurrentlyWearing(userId)
+    local data = getJSON("https://avatar.roblox.com/v1/users/" .. tostring(userId) .. "/currently-wearing")
+    if data and type(data.assetIds) == "table" then
+        return #data.assetIds, data.assetIds
+    end
+    return nil, nil
+end
+
+local function getGroups(userId)
+    -- Legacy public endpoint; wrapped so scanner survives if Roblox removes/blocks it.
+    local data = getJSON("https://groups.roblox.com/v1/users/" .. tostring(userId) .. "/groups/roles")
+    if data and type(data.data) == "table" then
+        return #data.data, data.data
+    end
+    return nil, nil
+end
+
+local function getBadges(userId, maxPages)
+    maxPages = maxPages or 3
+    local out = {}
+    local cursor = nil
+    local page = 0
+    local capped = false
+    local available = false
+
+    repeat
+        page += 1
+        local url = "https://badges.roblox.com/v1/users/" .. tostring(userId) .. "/badges?limit=100&sortOrder=Asc"
+        if cursor then
+            url ..= "&cursor=" .. HttpService:UrlEncode(cursor)
+        end
+        local data = getJSON(url)
+        if not data or type(data.data) ~= "table" then
+            break
+        end
+        available = true
+        for _, badge in ipairs(data.data) do
+            out[#out + 1] = badge
+        end
+        cursor = data.nextPageCursor
+        if cursor and page >= maxPages then
+            capped = true
+            break
+        end
+    until not cursor
+
+    return out, capped, available
+end
+
+local function getThumbnail(userId)
+    local ok, content = pcall(function()
+        local image, _ = Players:GetUserThumbnailAsync(
+            userId,
+            Enum.ThumbnailType.HeadShot,
+            Enum.ThumbnailSize.Size180x180
+        )
+        return image
+    end)
+    if ok then return content end
+    return ""
+end
+
+local function analyzeAccount(info, friendCount, badgeList, badgeCapped, badgeAvailable, groupCount, assetCount)
+    local signals = {}
+    local risk = 0
+    local alt = 0
+    local ageDays = ageDaysFromCreated(info and info.created)
+    local username = info and info.name or "?"
+    local display = info and info.displayName or username
+    local description = trim(info and info.description or "")
+    local customDisplay = safeLower(display) ~= safeLower(username)
+    local badgeCount = #badgeList
+
+    local fpsHits = 0
+    local fpsKinds = {}
+    local fpsNames = {}
+
+    for _, badge in ipairs(badgeList) do
+        local hay = tostring(badge.name or "") .. " " .. tostring(badge.description or "")
+        local hit = containsFPSKeyword(hay)
+        if hit then
+            fpsHits += 1
+            fpsKinds[hit] = true
+            if #fpsNames < 6 then
+                fpsNames[#fpsNames + 1] = tostring(badge.name or "Unnamed badge")
+            end
+        end
+    end
+
+    local fpsDiversity = 0
+    for _ in pairs(fpsKinds) do fpsDiversity += 1 end
+
+    if ageDays then
+        if ageDays < 30 then
+            risk += 30; alt += 38
+            signals[#signals + 1] = "Very new account (<30 days)"
+        elseif ageDays < 110 then
+            risk += 22; alt += 30
+            signals[#signals + 1] = "New account (<110 days)"
+        elseif ageDays < 365 then
+            risk += 8; alt += 12
+            signals[#signals + 1] = "Account under 1 year old"
+        end
+    end
+
+    if friendCount ~= nil then
+        if friendCount <= 5 then
+            risk += 16; alt += 22
+            signals[#signals + 1] = "Very low friend count (" .. friendCount .. ")"
+        elseif friendCount <= 15 then
+            risk += 8; alt += 10
+            signals[#signals + 1] = "Low friend count (" .. friendCount .. ")"
+        end
+    end
+
+    if not customDisplay then
+        if ageDays and ageDays < 365 then
+            risk += 8; alt += 10
+            signals[#signals + 1] = "Newer account with no custom display name"
+        else
+            alt += 3
+        end
+    end
+
+    if assetCount ~= nil then
+        if assetCount <= 4 then
+            risk += 8; alt += 15
+            signals[#signals + 1] = "Very basic avatar asset count (" .. assetCount .. ")"
+        elseif assetCount <= 6 then
+            alt += 7
+            signals[#signals + 1] = "Basic avatar asset count (" .. assetCount .. ")"
+        end
+    end
+
+    if description == "" then
+        alt += 4
+    end
+
+    if badgeAvailable then
+        if badgeCount < 10 then
+            risk += 12; alt += 15
+            signals[#signals + 1] = "Very few visible badges (" .. badgeCount .. ")"
+        elseif badgeCount < 30 then
+            risk += 6; alt += 7
+            signals[#signals + 1] = "Few visible badges (" .. badgeCount .. ")"
+        end
+    else
+        signals[#signals + 1] = "Badge list unavailable/private — not scored"
+    end
+
+    if ageDays and ageDays > 1000 then
+        local sparse = 0
+        if friendCount and friendCount <= 5 then sparse += 1 end
+        if badgeAvailable and badgeCount < 20 then sparse += 1 end
+        if assetCount and assetCount <= 5 then sparse += 1 end
+        if description == "" then sparse += 1 end
+        if sparse >= 3 then
+            risk += 10; alt += 25
+            signals[#signals + 1] = "Old account but unusually sparse/fresh profile"
+        end
+    end
+
+    if badgeAvailable then
+        if fpsHits > 0 then
+            signals[#signals + 1] = "FPS/shooter badge hits: " .. fpsHits .. " (diversity " .. fpsDiversity .. ")"
+            if fpsDiversity >= 4 then
+                alt -= 8
+            elseif fpsDiversity >= 2 then
+                alt -= 4
+            end
+        elseif ageDays and ageDays < 365 and badgeCount < 30 then
+            risk += 4
+            signals[#signals + 1] = "Little visible shooter badge history"
+        end
+    end
+
+    if groupCount ~= nil and groupCount == 0 and ageDays and ageDays < 365 then
+        alt += 3
+    end
+
+    risk = clamp(math.floor(risk), 0, 100)
+    alt = clamp(math.floor(alt), 0, 100)
+
+    local verdict
+    if risk >= 75 then
+        verdict = "HIGH SUSPICION"
+    elseif risk >= 50 then
+        verdict = "SUSPICIOUS PROFILE"
+    elseif risk >= 25 then
+        verdict = "NOT SURE"
+    else
+        verdict = "LOW SIGNAL"
+    end
+
+    return {
+        risk = risk,
+        alt = alt,
+        verdict = verdict,
+        ageDays = ageDays,
+        badgeCount = badgeCount,
+        badgeCapped = badgeCapped,
+        badgeAvailable = badgeAvailable,
+        fpsHits = fpsHits,
+        fpsDiversity = fpsDiversity,
+        fpsNames = fpsNames,
+        signals = signals,
+        customDisplay = customDisplay,
+    }
+end
+
+local function scanById(userId)
+    local info = getUserInfo(userId)
+    if not info then
+        return nil, "Could not fetch public user info"
+    end
+
+    local friendCount = getFriendCount(userId)
+    local assetCount = getCurrentlyWearing(userId)
+    local groupCount = getGroups(userId)
+    local badges, badgeCapped, badgeAvailable = getBadges(userId, 3)
+    local analysis = analyzeAccount(info, friendCount, badges, badgeCapped, badgeAvailable, groupCount, assetCount)
+
+    return {
+        userId = userId,
+        info = info,
+        friendCount = friendCount,
+        assetCount = assetCount,
+        groupCount = groupCount,
+        badges = badges,
+        analysis = analysis,
+        thumbnail = getThumbnail(userId),
+    }
+end
+
+--------------------------------------------------
+-- PERFORMANCE STATE/CACHE
+--------------------------------------------------
+local PERF = {
+    Textures = false,
+    Materials = false,
+    Particles = false,
+    Shadows = false,
+    PostFX = false,
+    Atmosphere = false,
+    Potato = false,
+    FPSCap = false,
+}
+
+local PCACHE = {
+    Textures = {},
+    Materials = {},
+    Particles = {},
+    Shadows = {},
+    PostFX = {},
+    Atmosphere = {},
+}
+
+local function safeGet(obj, prop)
+    local ok, v = pcall(function() return obj[prop] end)
+    if ok then return v end
+end
+
+local function safeSet(obj, prop, value)
+    pcall(function() obj[prop] = value end)
+end
+
+local function remember(cache, obj, prop)
+    if not cache[obj] then cache[obj] = {} end
+    if cache[obj][prop] == nil then cache[obj][prop] = safeGet(obj, prop) end
+end
+
+local function change(cache, obj, prop, value)
+    remember(cache, obj, prop)
+    safeSet(obj, prop, value)
+end
+
+local function restoreCache(cache)
+    for obj, props in pairs(cache) do
+        for prop, value in pairs(props) do
+            if value ~= nil then safeSet(obj, prop, value) end
+        end
+    end
+    table.clear(cache)
+end
+
+local function stripTextureObject(obj)
+    if obj:IsA("Decal") or obj:IsA("Texture") then
+        change(PCACHE.Textures, obj, "Transparency", 1)
+    elseif obj:IsA("MeshPart") then
+        change(PCACHE.Textures, obj, "TextureID", "")
+    elseif obj:IsA("SpecialMesh") then
+        change(PCACHE.Textures, obj, "TextureId", "")
+    elseif obj:IsA("SurfaceAppearance") then
+        change(PCACHE.Textures, obj, "ColorMap", "")
+        change(PCACHE.Textures, obj, "NormalMap", "")
+        change(PCACHE.Textures, obj, "RoughnessMap", "")
+        change(PCACHE.Textures, obj, "MetalnessMap", "")
+    end
+end
+
+local function stripMaterialObject(obj)
+    if obj:IsA("BasePart") then
+        change(PCACHE.Materials, obj, "Material", Enum.Material.SmoothPlastic)
+        change(PCACHE.Materials, obj, "Reflectance", 0)
+    end
+end
+
+local particleTypes = {
+    ParticleEmitter = true, Trail = true, Beam = true,
+    Smoke = true, Fire = true, Sparkles = true,
+}
+
+local function stripParticleObject(obj)
+    if particleTypes[obj.ClassName] then
+        change(PCACHE.Particles, obj, "Enabled", false)
+    end
+end
+
+local function stripShadowObject(obj)
+    if obj:IsA("BasePart") then
+        change(PCACHE.Shadows, obj, "CastShadow", false)
+    end
+end
+
+local function stripPostObject(obj)
+    if obj:IsA("BloomEffect") or obj:IsA("BlurEffect") or obj:IsA("ColorCorrectionEffect")
+        or obj:IsA("DepthOfFieldEffect") or obj:IsA("SunRaysEffect") then
+        change(PCACHE.PostFX, obj, "Enabled", false)
+    end
+end
+
+local function stripAtmosObject(obj)
+    if obj:IsA("Atmosphere") then
+        change(PCACHE.Atmosphere, obj, "Density", 0)
+        change(PCACHE.Atmosphere, obj, "Haze", 0)
+    elseif obj:IsA("Clouds") then
+        change(PCACHE.Atmosphere, obj, "Coverage", 0)
+        change(PCACHE.Atmosphere, obj, "Density", 0)
+    end
+end
+
+local function setTextures(on)
+    PERF.Textures = on
+    if on then
+        for _, obj in ipairs(workspace:GetDescendants()) do stripTextureObject(obj) end
+    else
+        restoreCache(PCACHE.Textures)
+    end
+end
+
+local function setMaterials(on)
+    PERF.Materials = on
+    if on then
+        for _, obj in ipairs(workspace:GetDescendants()) do stripMaterialObject(obj) end
+    else
+        restoreCache(PCACHE.Materials)
+    end
+end
+
+local function setParticles(on)
+    PERF.Particles = on
+    if on then
+        for _, obj in ipairs(workspace:GetDescendants()) do stripParticleObject(obj) end
+    else
+        restoreCache(PCACHE.Particles)
+    end
+end
+
+local function setShadows(on)
+    PERF.Shadows = on
+    if on then
+        change(PCACHE.Shadows, Lighting, "GlobalShadows", false)
+        for _, obj in ipairs(workspace:GetDescendants()) do stripShadowObject(obj) end
+    else
+        restoreCache(PCACHE.Shadows)
+    end
+end
+
+local function setPostFX(on)
+    PERF.PostFX = on
+    if on then
+        for _, obj in ipairs(Lighting:GetDescendants()) do stripPostObject(obj) end
+    else
+        restoreCache(PCACHE.PostFX)
+    end
+end
+
+local function setAtmosphere(on)
+    PERF.Atmosphere = on
+    if on then
+        for _, obj in ipairs(Lighting:GetDescendants()) do stripAtmosObject(obj) end
+        for _, obj in ipairs(workspace:GetDescendants()) do stripAtmosObject(obj) end
+    else
+        restoreCache(PCACHE.Atmosphere)
+    end
+end
+
+local function setPotato(on)
+    PERF.Potato = on
+    setTextures(on)
+    setMaterials(on)
+    setParticles(on)
+    setShadows(on)
+    setPostFX(on)
+    setAtmosphere(on)
+end
+
+local function setFPSCap(on)
+    if on then
+        if typeof(setfpscap) == "function" then
+            local ok = pcall(function() setfpscap(9999) end)
+            PERF.FPSCap = ok
+            return ok
+        end
+        PERF.FPSCap = false
+        return false
+    else
+        if typeof(setfpscap) == "function" then
+            pcall(function() setfpscap(240) end)
+        end
+        PERF.FPSCap = false
+        return true
+    end
+end
+
+local function restorePerformance()
+    PERF.Potato = false
+    PERF.Textures = false
+    PERF.Materials = false
+    PERF.Particles = false
+    PERF.Shadows = false
+    PERF.PostFX = false
+    PERF.Atmosphere = false
+    restoreCache(PCACHE.Textures)
+    restoreCache(PCACHE.Materials)
+    restoreCache(PCACHE.Particles)
+    restoreCache(PCACHE.Shadows)
+    restoreCache(PCACHE.PostFX)
+    restoreCache(PCACHE.Atmosphere)
+end
+
+--------------------------------------------------
+-- CLEAN OLD UI
+--------------------------------------------------
+local old = PlayerGui:FindFirstChild(APP_NAME)
+if old then old:Destroy() end
+
+--------------------------------------------------
+-- PREMIUM UI SYSTEM
+--------------------------------------------------
+COLORS.bg = Color3.fromRGB(8, 10, 14)
+COLORS.panel = Color3.fromRGB(13, 16, 22)
+COLORS.card = Color3.fromRGB(20, 24, 32)
+COLORS.cardHover = Color3.fromRGB(25, 30, 40)
+COLORS.stroke = Color3.fromRGB(45, 53, 67)
+COLORS.text = Color3.fromRGB(246, 248, 252)
+COLORS.sub = Color3.fromRGB(142, 153, 173)
+COLORS.green = Color3.fromRGB(68, 224, 148)
+COLORS.yellow = Color3.fromRGB(255, 203, 92)
+COLORS.orange = Color3.fromRGB(255, 148, 84)
+COLORS.red = Color3.fromRGB(255, 91, 111)
+COLORS.blue = Color3.fromRGB(91, 151, 255)
+COLORS.purple = Color3.fromRGB(167, 116, 255)
+local ACCENT = Color3.fromRGB(92, 132, 255)
+local ACCENT2 = Color3.fromRGB(158, 104, 255)
+local SURFACE = Color3.fromRGB(16, 19, 26)
+local SURFACE2 = Color3.fromRGB(24, 29, 39)
+local MUTED = Color3.fromRGB(100, 111, 132)
+
+local function gradient(obj, c1, c2, rotation)
+    local g = Instance.new("UIGradient")
+    g.Color = ColorSequence.new(c1, c2)
+    g.Rotation = rotation or 0
+    g.Parent = obj
+    return g
+end
+
+local function addPadding(obj, l, r, t, b)
+    local p = Instance.new("UIPadding")
+    p.PaddingLeft = UDim.new(0, l or 0)
+    p.PaddingRight = UDim.new(0, r or 0)
+    p.PaddingTop = UDim.new(0, t or 0)
+    p.PaddingBottom = UDim.new(0, b or 0)
+    p.Parent = obj
+    return p
+end
+
+local function label(parent, text, size, color, font)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Text = text or ""
+    l.TextColor3 = color or COLORS.text
+    l.TextSize = size or 12
+    l.Font = font or Enum.Font.Gotham
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextYAlignment = Enum.TextYAlignment.Center
+    l.Parent = parent
+    return l
+end
+
+local function buttonFX(btn, normal, hover)
+    btn.AutoButtonColor = false
+    track(btn.MouseEnter:Connect(function()
+        tw(btn, {BackgroundColor3 = hover or COLORS.cardHover}, 0.12)
+    end))
+    track(btn.MouseLeave:Connect(function()
+        tw(btn, {BackgroundColor3 = normal or COLORS.card}, 0.12)
+    end))
+end
+
+--------------------------------------------------
+-- ROOT / BACKDROP
+--------------------------------------------------
+local CoreGui = game:GetService("CoreGui")
+
+local gui = Instance.new("ScreenGui")
+gui.Name = APP_NAME
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 2147483647
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+
+-- Use the full screen where the runtime supports these newer ScreenGui properties.
+pcall(function()
+    gui.ScreenInsets = Enum.ScreenInsets.None
+end)
+
+pcall(function()
+    gui.ClipToDeviceSafeArea = false
+end)
+
+-- Prefer an executor hidden-UI container. CoreGui is the fallback.
+local guiParent = CoreGui
+pcall(function()
+    if gethui then
+        local hidden = gethui()
+        if hidden then
+            guiParent = hidden
+        end
+    end
+end)
+
+-- Protect the GUI on runtimes that expose the Synapse-style helper.
+pcall(function()
+    if syn and syn.protect_gui then
+        syn.protect_gui(gui)
+    end
+end)
+
+-- Some executor runtimes expose this as a hidden ScreenGui property.
+-- sethiddenproperty is tried first because direct assignment may be blocked.
+pcall(function()
+    if sethiddenproperty then
+        sethiddenproperty(gui, "OnTopOfCoreBlur", true)
+    else
+        gui.OnTopOfCoreBlur = true
+    end
+end)
+
+gui.Parent = guiParent
+
+local shadow = Instance.new("Frame")
+shadow.Name = "Shadow"
+shadow.Size = UDim2.fromOffset(976, 636)
+shadow.Position = UDim2.new(0.5, -480, 0.5, -312)
+shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+shadow.BackgroundTransparency = 0.47
+shadow.BorderSizePixel = 0
+shadow.Parent = gui
+shadow.ZIndex = 999998
+round(shadow, 23)
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(960, 620)
+main.Position = UDim2.new(0.5, -480, 0.5, -310)
+main.BackgroundColor3 = COLORS.panel
+main.BorderSizePixel = 0
+main.ClipsDescendants = true
+main.Parent = gui
+main.ZIndex = 999999
+round(main, 20)
+stroke(main, Color3.fromRGB(56, 66, 84), 1, 0.25)
+gradient(main, Color3.fromRGB(16, 19, 27), Color3.fromRGB(10, 12, 17), 90)
+
+--------------------------------------------------
+-- HEADER
+--------------------------------------------------
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 78)
+header.BackgroundColor3 = Color3.fromRGB(11, 14, 20)
+header.BorderSizePixel = 0
+header.Parent = main
+
+local headerLine = Instance.new("Frame")
+headerLine.Size = UDim2.new(1, 0, 0, 1)
+headerLine.Position = UDim2.new(0, 0, 1, -1)
+headerLine.BackgroundColor3 = Color3.fromRGB(43, 50, 64)
+headerLine.BackgroundTransparency = 0.25
+headerLine.BorderSizePixel = 0
+headerLine.Parent = header
+
+local logo = Instance.new("Frame")
+logo.Size = UDim2.fromOffset(44, 44)
+logo.Position = UDim2.fromOffset(18, 17)
+logo.BackgroundColor3 = ACCENT
+logo.BorderSizePixel = 0
+logo.Parent = header
+round(logo, 12)
+gradient(logo, ACCENT, ACCENT2, 35)
+
+local logoText = label(logo, "O", 23, Color3.new(1,1,1), Enum.Font.GothamBlack)
+logoText.Size = UDim2.fromScale(1,1)
+logoText.TextXAlignment = Enum.TextXAlignment.Center
+
+local title = label(header, "OP1 INTEL", 18, COLORS.text, Enum.Font.GothamBold)
+title.Position = UDim2.fromOffset(75, 15)
+title.Size = UDim2.fromOffset(220, 25)
+
+local subtitle = label(header, "Account intelligence  •  performance control", 11, COLORS.sub, Enum.Font.Gotham)
+subtitle.Position = UDim2.fromOffset(75, 40)
+subtitle.Size = UDim2.fromOffset(380, 20)
+
+local versionPill = Instance.new("TextLabel")
+versionPill.Size = UDim2.fromOffset(62, 22)
+versionPill.Position = UDim2.fromOffset(204, 17)
+versionPill.BackgroundColor3 = Color3.fromRGB(29, 35, 47)
+versionPill.Text = "V4 LAB"
+versionPill.TextColor3 = Color3.fromRGB(178, 192, 219)
+versionPill.TextSize = 9
+versionPill.Font = Enum.Font.GothamBold
+versionPill.Parent = header
+round(versionPill, 99)
+stroke(versionPill, Color3.fromRGB(65, 77, 98), 1, 0.35)
+
+local fpsWrap = Instance.new("Frame")
+fpsWrap.Size = UDim2.fromOffset(112, 42)
+fpsWrap.Position = UDim2.new(1, -300, 0, 18)
+fpsWrap.BackgroundColor3 = SURFACE2
+fpsWrap.BorderSizePixel = 0
+fpsWrap.Parent = header
+round(fpsWrap, 11)
+stroke(fpsWrap, COLORS.stroke, 1, 0.35)
+
+local fpsDot = Instance.new("Frame")
+fpsDot.Size = UDim2.fromOffset(8, 8)
+fpsDot.Position = UDim2.fromOffset(12, 17)
+fpsDot.BackgroundColor3 = COLORS.green
+fpsDot.Parent = fpsWrap
+round(fpsDot, 99)
+
+local fpsBadge = label(fpsWrap, "FPS --", 12, COLORS.text, Enum.Font.GothamBold)
+fpsBadge.Position = UDim2.fromOffset(28, 5)
+fpsBadge.Size = UDim2.fromOffset(75, 20)
+local fpsSub = label(fpsWrap, "LIVE", 8, COLORS.sub, Enum.Font.GothamBold)
+fpsSub.Position = UDim2.fromOffset(28, 23)
+fpsSub.Size = UDim2.fromOffset(50, 12)
+
+local hideBtn = Instance.new("TextButton")
+hideBtn.Size = UDim2.fromOffset(42, 42)
+hideBtn.Position = UDim2.new(1, -178, 0, 18)
+hideBtn.BackgroundColor3 = SURFACE2
+hideBtn.Text = "—"
+hideBtn.TextColor3 = COLORS.text
+hideBtn.TextSize = 18
+hideBtn.Font = Enum.Font.GothamBold
+hideBtn.Parent = header
+round(hideBtn, 11)
+stroke(hideBtn, COLORS.stroke, 1, 0.35)
+buttonFX(hideBtn, SURFACE2, Color3.fromRGB(34, 40, 52))
+
+local unload = Instance.new("TextButton")
+unload.Size = UDim2.fromOffset(112, 42)
+unload.Position = UDim2.new(1, -126, 0, 18)
+unload.BackgroundColor3 = Color3.fromRGB(54, 24, 33)
+unload.Text = "UNLOAD"
+unload.TextColor3 = COLORS.red
+unload.Font = Enum.Font.GothamBold
+unload.TextSize = 11
+unload.AutoButtonColor = false
+unload.Parent = header
+round(unload, 11)
+stroke(unload, Color3.fromRGB(116, 49, 66), 1, 0.25)
+buttonFX(unload, Color3.fromRGB(54,24,33), Color3.fromRGB(72,30,42))
+
+--------------------------------------------------
+-- SIDEBAR
+--------------------------------------------------
+local sidebar = Instance.new("Frame")
+sidebar.Position = UDim2.fromOffset(0, 78)
+sidebar.Size = UDim2.new(0, 196, 1, -78)
+sidebar.BackgroundColor3 = Color3.fromRGB(10, 13, 18)
+sidebar.BorderSizePixel = 0
+sidebar.Parent = main
+
+local sideDivider = Instance.new("Frame")
+sideDivider.Size = UDim2.new(0, 1, 1, 0)
+sideDivider.Position = UDim2.new(1, -1, 0, 0)
+sideDivider.BackgroundColor3 = Color3.fromRGB(39, 47, 61)
+sideDivider.BackgroundTransparency = 0.3
+sideDivider.BorderSizePixel = 0
+sideDivider.Parent = sidebar
+
+local navTitle = label(sidebar, "WORKSPACE", 9, MUTED, Enum.Font.GothamBold)
+navTitle.Position = UDim2.fromOffset(18, 18)
+navTitle.Size = UDim2.fromOffset(150, 16)
+
+local navHolder = Instance.new("Frame")
+navHolder.Position = UDim2.fromOffset(10, 44)
+navHolder.Size = UDim2.new(1, -20, 0, 124)
+navHolder.BackgroundTransparency = 1
+navHolder.Parent = sidebar
+local navLayout = Instance.new("UIListLayout")
+navLayout.Padding = UDim.new(0, 8)
+navLayout.Parent = navHolder
+
+local TAB_META = {
+    Scanner = {icon = "⌕", title = "Account Scanner", sub = "Profile intelligence"},
+    Performance = {icon = "⚡", title = "Performance", sub = "Client optimization"},
+}
+local TAB_BUTTONS = {}
+
+local function makeTabButton(key)
+    local meta = TAB_META[key]
+    local b = Instance.new("TextButton")
+    b.Name = key .. "Tab"
+    b.Size = UDim2.new(1, 0, 0, 58)
+    b.BackgroundColor3 = Color3.fromRGB(15, 18, 25)
+    b.Text = ""
+    b.AutoButtonColor = false
+    b.Parent = navHolder
+    round(b, 11)
+
+    local indicator = Instance.new("Frame")
+    indicator.Name = "Indicator"
+    indicator.Size = UDim2.fromOffset(3, 30)
+    indicator.Position = UDim2.fromOffset(0, 14)
+    indicator.BackgroundColor3 = ACCENT
+    indicator.BackgroundTransparency = 1
+    indicator.BorderSizePixel = 0
+    indicator.Parent = b
+    round(indicator, 99)
+
+    local iconWrap = Instance.new("Frame")
+    iconWrap.Size = UDim2.fromOffset(34, 34)
+    iconWrap.Position = UDim2.fromOffset(11, 12)
+    iconWrap.BackgroundColor3 = Color3.fromRGB(25, 30, 40)
+    iconWrap.BorderSizePixel = 0
+    iconWrap.Parent = b
+    round(iconWrap, 9)
+
+    local ic = label(iconWrap, meta.icon, 17, COLORS.sub, Enum.Font.GothamBold)
+    ic.Name = "Icon"
+    ic.Size = UDim2.fromScale(1,1)
+    ic.TextXAlignment = Enum.TextXAlignment.Center
+
+    local tl = label(b, meta.title, 11, COLORS.text, Enum.Font.GothamSemibold)
+    tl.Position = UDim2.fromOffset(54, 11)
+    tl.Size = UDim2.new(1, -62, 0, 18)
+    local sl = label(b, meta.sub, 9, COLORS.sub, Enum.Font.Gotham)
+    sl.Position = UDim2.fromOffset(54, 30)
+    sl.Size = UDim2.new(1, -62, 0, 16)
+
+    buttonFX(b, Color3.fromRGB(15,18,25), Color3.fromRGB(22,27,36))
+    TAB_BUTTONS[key] = b
+    return b
+end
+
+local scanTabBtn = makeTabButton("Scanner")
+local perfTabBtn = makeTabButton("Performance")
+
+local miniCard = Instance.new("Frame")
+miniCard.Size = UDim2.new(1, -20, 0, 88)
+miniCard.Position = UDim2.new(0, 10, 1, -104)
+miniCard.BackgroundColor3 = Color3.fromRGB(15, 18, 25)
+miniCard.BorderSizePixel = 0
+miniCard.Parent = sidebar
+round(miniCard, 12)
+stroke(miniCard, COLORS.stroke, 1, 0.5)
+
+local miniIcon = label(miniCard, "⌨", 18, COLORS.blue, Enum.Font.GothamBold)
+miniIcon.Position = UDim2.fromOffset(12, 12)
+miniIcon.Size = UDim2.fromOffset(24, 22)
+local miniTitle = label(miniCard, "Quick hide", 10, COLORS.text, Enum.Font.GothamSemibold)
+miniTitle.Position = UDim2.fromOffset(40, 10)
+miniTitle.Size = UDim2.fromOffset(105, 18)
+local miniSub = label(miniCard, "RightShift", 9, COLORS.sub, Enum.Font.Gotham)
+miniSub.Position = UDim2.fromOffset(40, 28)
+miniSub.Size = UDim2.fromOffset(100, 16)
+local miniNote = label(miniCard, "Scores are signals, not proof.", 8, MUTED, Enum.Font.Gotham)
+miniNote.Position = UDim2.fromOffset(12, 58)
+miniNote.Size = UDim2.new(1, -24, 0, 14)
+
+--------------------------------------------------
+-- PAGE HOLDER
+--------------------------------------------------
+local pageHolder = Instance.new("Frame")
+pageHolder.Position = UDim2.fromOffset(196, 78)
+pageHolder.Size = UDim2.new(1, -196, 1, -78)
+pageHolder.BackgroundTransparency = 1
+pageHolder.Parent = main
+
+local scannerPage = Instance.new("Frame")
+scannerPage.Size = UDim2.fromScale(1, 1)
+scannerPage.BackgroundTransparency = 1
+scannerPage.Parent = pageHolder
+
+local perfPage = Instance.new("Frame")
+perfPage.Size = UDim2.fromScale(1, 1)
+perfPage.BackgroundTransparency = 1
+perfPage.Visible = false
+perfPage.Parent = pageHolder
+
+local function setTab(name)
+    ACTIVE_TAB = name
+    scannerPage.Visible = name == "Scanner"
+    perfPage.Visible = name == "Performance"
+    for key, b in pairs(TAB_BUTTONS) do
+        local active = key == name
+        local ind = b:FindFirstChild("Indicator")
+        local iconWrap = b:FindFirstChildOfClass("Frame")
+        tw(b, {BackgroundColor3 = active and Color3.fromRGB(24, 30, 43) or Color3.fromRGB(15,18,25)}, 0.14)
+        if ind then tw(ind, {BackgroundTransparency = active and 0 or 1}, 0.14) end
+        if iconWrap then tw(iconWrap, {BackgroundColor3 = active and Color3.fromRGB(36, 46, 67) or Color3.fromRGB(25,30,40)}, 0.14) end
+    end
+end
+
+track(scanTabBtn.MouseButton1Click:Connect(function() setTab("Scanner") end))
+track(perfTabBtn.MouseButton1Click:Connect(function() setTab("Performance") end))
+setTab("Scanner")
+
+--------------------------------------------------
+-- TOAST / STATUS
+--------------------------------------------------
+local toast = Instance.new("Frame")
+toast.Size = UDim2.fromOffset(290, 42)
+toast.Position = UDim2.new(1, -308, 1, 54)
+toast.BackgroundColor3 = Color3.fromRGB(25, 31, 42)
+toast.BorderSizePixel = 0
+toast.Parent = main
+round(toast, 11)
+stroke(toast, COLORS.stroke, 1, 0.25)
+local toastDot = Instance.new("Frame")
+toastDot.Size = UDim2.fromOffset(7,7)
+toastDot.Position = UDim2.fromOffset(13,18)
+toastDot.BackgroundColor3 = COLORS.blue
+toastDot.Parent = toast
+round(toastDot,99)
+local toastText = label(toast, "Ready", 10, COLORS.text, Enum.Font.GothamSemibold)
+toastText.Position = UDim2.fromOffset(29, 0)
+toastText.Size = UDim2.new(1, -40, 1, 0)
+
+local toastBusy = false
+local function showToast(text, color)
+    if UNLOADED then return end
+    toastText.Text = tostring(text)
+    toastDot.BackgroundColor3 = color or COLORS.blue
+    tw(toast, {Position = UDim2.new(1, -308, 1, -54)}, 0.22)
+    toastBusy = true
+    task.delay(2.3, function()
+        if not UNLOADED and toastBusy then
+            toastBusy = false
+            tw(toast, {Position = UDim2.new(1, -308, 1, 54)}, 0.22)
+        end
+    end)
+end
+
+--------------------------------------------------
+-- SCANNER PAGE: HEADING
+--------------------------------------------------
+local scanHeading = label(scannerPage, "Account Scanner", 19, COLORS.text, Enum.Font.GothamBold)
+scanHeading.Position = UDim2.fromOffset(22, 18)
+scanHeading.Size = UDim2.fromOffset(260, 26)
+local scanDesc = label(scannerPage, "Scan public Roblox profile signals across up to 8 accounts.", 10, COLORS.sub, Enum.Font.Gotham)
+scanDesc.Position = UDim2.fromOffset(22, 45)
+scanDesc.Size = UDim2.fromOffset(450, 18)
+
+local limitPill = Instance.new("TextLabel")
+limitPill.Size = UDim2.fromOffset(76, 24)
+limitPill.Position = UDim2.new(1, -98, 0, 24)
+limitPill.BackgroundColor3 = Color3.fromRGB(31, 37, 50)
+limitPill.Text = "MAX 8"
+limitPill.TextColor3 = Color3.fromRGB(179, 191, 215)
+limitPill.Font = Enum.Font.GothamBold
+limitPill.TextSize = 9
+limitPill.Parent = scannerPage
+round(limitPill, 99)
+
+--------------------------------------------------
+-- SCANNER COMMAND CARD
+--------------------------------------------------
+local scanTop = Instance.new("Frame")
+scanTop.Position = UDim2.fromOffset(22, 76)
+scanTop.Size = UDim2.new(1, -44, 0, 112)
+scanTop.BackgroundColor3 = COLORS.card
+scanTop.BorderSizePixel = 0
+scanTop.Parent = scannerPage
+round(scanTop, 14)
+stroke(scanTop, COLORS.stroke, 1, 0.28)
+
+gradient(scanTop, Color3.fromRGB(22,27,37), Color3.fromRGB(17,21,29), 0)
+
+local inputWrap = Instance.new("Frame")
+inputWrap.Position = UDim2.fromOffset(12, 12)
+inputWrap.Size = UDim2.new(1, -246, 0, 44)
+inputWrap.BackgroundColor3 = Color3.fromRGB(12, 15, 21)
+inputWrap.BorderSizePixel = 0
+inputWrap.Parent = scanTop
+round(inputWrap, 10)
+stroke(inputWrap, Color3.fromRGB(48,58,75), 1, 0.35)
+
+local searchIcon = label(inputWrap, "⌕", 17, COLORS.sub, Enum.Font.GothamBold)
+searchIcon.Position = UDim2.fromOffset(12, 0)
+searchIcon.Size = UDim2.fromOffset(24, 44)
+searchIcon.TextXAlignment = Enum.TextXAlignment.Center
+
+local input = Instance.new("TextBox")
+input.Position = UDim2.fromOffset(42, 0)
+input.Size = UDim2.new(1, -50, 1, 0)
+input.BackgroundTransparency = 1
+input.PlaceholderText = "Username, username2, username3..."
+input.Text = ""
+input.ClearTextOnFocus = false
+input.TextColor3 = COLORS.text
+input.PlaceholderColor3 = Color3.fromRGB(99, 111, 132)
+input.Font = Enum.Font.Gotham
+input.TextSize = 11
+input.TextXAlignment = Enum.TextXAlignment.Left
+input.Parent = inputWrap
+
+local scanButton = Instance.new("TextButton")
+scanButton.Position = UDim2.new(1, -222, 0, 12)
+scanButton.Size = UDim2.fromOffset(102, 44)
+scanButton.BackgroundColor3 = ACCENT
+scanButton.Text = "SCAN"
+scanButton.TextColor3 = Color3.new(1,1,1)
+scanButton.Font = Enum.Font.GothamBold
+scanButton.TextSize = 11
+scanButton.Parent = scanTop
+round(scanButton, 10)
+gradient(scanButton, Color3.fromRGB(94,145,255), Color3.fromRGB(112,105,255), 0)
+buttonFX(scanButton, ACCENT, Color3.fromRGB(110, 155, 255))
+
+local lobbyButton = Instance.new("TextButton")
+lobbyButton.Position = UDim2.new(1, -112, 0, 12)
+lobbyButton.Size = UDim2.fromOffset(100, 44)
+lobbyButton.BackgroundColor3 = Color3.fromRGB(41, 34, 61)
+lobbyButton.Text = "LOBBY x8"
+lobbyButton.TextColor3 = Color3.fromRGB(207, 184, 255)
+lobbyButton.Font = Enum.Font.GothamBold
+lobbyButton.TextSize = 10
+lobbyButton.Parent = scanTop
+round(lobbyButton, 10)
+stroke(lobbyButton, Color3.fromRGB(91,72,133), 1, 0.2)
+buttonFX(lobbyButton, Color3.fromRGB(41,34,61), Color3.fromRGB(53,42,76))
+
+local statusDot = Instance.new("Frame")
+statusDot.Size = UDim2.fromOffset(7,7)
+statusDot.Position = UDim2.fromOffset(14, 78)
+statusDot.BackgroundColor3 = COLORS.green
+statusDot.Parent = scanTop
+round(statusDot, 99)
+
+local scanStatus = label(scanTop, "Ready • heuristic signals only", 9, COLORS.sub, Enum.Font.Gotham)
+scanStatus.Position = UDim2.fromOffset(29, 67)
+scanStatus.Size = UDim2.new(1, -42, 0, 28)
+
+--------------------------------------------------
+-- RESULTS AREA
+--------------------------------------------------
+local resultHeader = label(scannerPage, "RESULTS", 9, MUTED, Enum.Font.GothamBold)
+resultHeader.Position = UDim2.fromOffset(22, 203)
+resultHeader.Size = UDim2.fromOffset(120, 18)
+
+local results = Instance.new("ScrollingFrame")
+results.Position = UDim2.fromOffset(22, 226)
+results.Size = UDim2.new(1, -44, 1, -244)
+results.BackgroundTransparency = 1
+results.BorderSizePixel = 0
+results.ScrollBarThickness = 3
+results.ScrollBarImageColor3 = Color3.fromRGB(66, 77, 98)
+results.AutomaticCanvasSize = Enum.AutomaticSize.Y
+results.CanvasSize = UDim2.new()
+results.Parent = scannerPage
+
+local resultsLayout = Instance.new("UIListLayout")
+resultsLayout.Padding = UDim.new(0, 12)
+resultsLayout.Parent = results
+
+local function clearResults()
+    for _, child in ipairs(results:GetChildren()) do
+        if child ~= resultsLayout then child:Destroy() end
+    end
+end
+
+local function verdictColor(verdict)
+    if verdict == "HIGH SUSPICION" then return COLORS.red end
+    if verdict == "SUSPICIOUS PROFILE" then return COLORS.orange end
+    if verdict == "NOT SURE" then return COLORS.yellow end
+    return COLORS.green
+end
+
+local function metricChip(parent, x, width, titleText, valueText, color)
+    local chip = Instance.new("Frame")
+    chip.Position = UDim2.fromOffset(x, 0)
+    chip.Size = UDim2.fromOffset(width, 38)
+    chip.BackgroundColor3 = Color3.fromRGB(15, 19, 26)
+    chip.BorderSizePixel = 0
+    chip.Parent = parent
+    round(chip, 9)
+    stroke(chip, Color3.fromRGB(44,53,68), 1, 0.48)
+
+    local v = label(chip, valueText, 11, color or COLORS.text, Enum.Font.GothamBold)
+    v.Position = UDim2.fromOffset(9, 3)
+    v.Size = UDim2.new(1, -18, 0, 17)
+    local t = label(chip, titleText, 8, MUTED, Enum.Font.GothamBold)
+    t.Position = UDim2.fromOffset(9, 19)
+    t.Size = UDim2.new(1, -18, 0, 13)
+    return chip
+end
+
+local function addErrorCard(name, message)
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(1, -4, 0, 76)
+    card.BackgroundColor3 = Color3.fromRGB(29, 20, 25)
+    card.BorderSizePixel = 0
+    card.Parent = results
+    round(card, 12)
+    stroke(card, Color3.fromRGB(102, 47, 61), 1, 0.35)
+
+    local strip = Instance.new("Frame")
+    strip.Size = UDim2.fromOffset(3, 42)
+    strip.Position = UDim2.fromOffset(0, 17)
+    strip.BackgroundColor3 = COLORS.red
+    strip.BorderSizePixel = 0
+    strip.Parent = card
+    round(strip, 99)
+
+    local t = label(card, tostring(name), 12, COLORS.text, Enum.Font.GothamBold)
+    t.Position = UDim2.fromOffset(16, 12)
+    t.Size = UDim2.new(1, -30, 0, 20)
+    local d = label(card, tostring(message), 9, COLORS.sub, Enum.Font.Gotham)
+    d.Position = UDim2.fromOffset(16, 35)
+    d.Size = UDim2.new(1, -30, 0, 20)
+end
+
+local function addResultCard(data)
+    local info = data.info
+    local a = data.analysis
+    local key = tostring(data.userId)
+    local previous = DB[key]
+    local accent = verdictColor(a.verdict)
+
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(1, -4, 0, 252)
+    card.BackgroundColor3 = COLORS.card
+    card.BorderSizePixel = 0
+    card.Parent = results
+    round(card, 14)
+    stroke(card, Color3.fromRGB(52,62,79), 1, 0.3)
+
+    local accentBar = Instance.new("Frame")
+    accentBar.Size = UDim2.fromOffset(3, 204)
+    accentBar.Position = UDim2.fromOffset(0, 24)
+    accentBar.BackgroundColor3 = accent
+    accentBar.BorderSizePixel = 0
+    accentBar.Parent = card
+    round(accentBar, 99)
+
+    local avatarWrap = Instance.new("Frame")
+    avatarWrap.Position = UDim2.fromOffset(14, 14)
+    avatarWrap.Size = UDim2.fromOffset(68, 68)
+    avatarWrap.BackgroundColor3 = Color3.fromRGB(12,15,21)
+    avatarWrap.BorderSizePixel = 0
+    avatarWrap.Parent = card
+    round(avatarWrap, 14)
+    stroke(avatarWrap, Color3.fromRGB(52,62,79), 1, 0.25)
+
+    local avatar = Instance.new("ImageLabel")
+    avatar.Position = UDim2.fromOffset(4,4)
+    avatar.Size = UDim2.new(1,-8,1,-8)
+    avatar.BackgroundTransparency = 1
+    avatar.Image = data.thumbnail or ""
+    avatar.Parent = avatarWrap
+    round(avatar, 11)
+
+    local name = label(card, tostring(info.displayName or info.name), 14, COLORS.text, Enum.Font.GothamBold)
+    name.Position = UDim2.fromOffset(94, 13)
+    name.Size = UDim2.new(1, -360, 0, 22)
+    local username = label(card, "@" .. tostring(info.name) .. "  •  ID " .. tostring(data.userId), 9, COLORS.sub, Enum.Font.Gotham)
+    username.Position = UDim2.fromOffset(94, 36)
+    username.Size = UDim2.new(1, -360, 0, 16)
+
+    local verdict = Instance.new("TextLabel")
+    verdict.Position = UDim2.fromOffset(94, 58)
+    verdict.Size = UDim2.fromOffset(164, 22)
+    verdict.BackgroundColor3 = Color3.fromRGB(26, 30, 39)
+    verdict.Text = a.verdict
+    verdict.TextColor3 = accent
+    verdict.Font = Enum.Font.GothamBold
+    verdict.TextSize = 9
+    verdict.Parent = card
+    round(verdict, 99)
+    stroke(verdict, accent, 1, 0.55)
+
+    local seen = label(card, previous and ("Saved tag: " .. tostring(previous.tag or "none")) or "First scan in local DB", 8, MUTED, Enum.Font.Gotham)
+    seen.Position = UDim2.fromOffset(268, 61)
+    seen.Size = UDim2.new(1, -470, 0, 16)
+
+    local scorePanel = Instance.new("Frame")
+    scorePanel.Position = UDim2.new(1, -244, 0, 14)
+    scorePanel.Size = UDim2.fromOffset(228, 68)
+    scorePanel.BackgroundColor3 = Color3.fromRGB(14, 17, 24)
+    scorePanel.BorderSizePixel = 0
+    scorePanel.Parent = card
+    round(scorePanel, 11)
+    stroke(scorePanel, Color3.fromRGB(49,58,74), 1, 0.4)
+
+    local riskTitle = label(scorePanel, "RISK", 8, MUTED, Enum.Font.GothamBold)
+    riskTitle.Position = UDim2.fromOffset(12, 9)
+    riskTitle.Size = UDim2.fromOffset(70, 12)
+    local riskValue = label(scorePanel, tostring(a.risk) .. "/100", 12, accent, Enum.Font.GothamBold)
+    riskValue.Position = UDim2.fromOffset(12, 23)
+    riskValue.Size = UDim2.fromOffset(70, 17)
+    local riskTrack = Instance.new("Frame")
+    riskTrack.Position = UDim2.fromOffset(12, 47)
+    riskTrack.Size = UDim2.fromOffset(86, 5)
+    riskTrack.BackgroundColor3 = Color3.fromRGB(37,42,52)
+    riskTrack.BorderSizePixel = 0
+    riskTrack.Parent = scorePanel
+    round(riskTrack,99)
+    local riskFill = Instance.new("Frame")
+    riskFill.Size = UDim2.new(clamp(a.risk,0,100)/100,0,1,0)
+    riskFill.BackgroundColor3 = accent
+    riskFill.BorderSizePixel = 0
+    riskFill.Parent = riskTrack
+    round(riskFill,99)
+
+    local split = Instance.new("Frame")
+    split.Position = UDim2.fromOffset(113, 11)
+    split.Size = UDim2.fromOffset(1, 45)
+    split.BackgroundColor3 = Color3.fromRGB(46,53,66)
+    split.BorderSizePixel = 0
+    split.Parent = scorePanel
+
+    local altTitle = label(scorePanel, "ALT", 8, MUTED, Enum.Font.GothamBold)
+    altTitle.Position = UDim2.fromOffset(126, 9)
+    altTitle.Size = UDim2.fromOffset(70, 12)
+    local altValue = label(scorePanel, tostring(a.alt) .. "/100", 12, COLORS.purple, Enum.Font.GothamBold)
+    altValue.Position = UDim2.fromOffset(126, 23)
+    altValue.Size = UDim2.fromOffset(70, 17)
+    local altTrack = Instance.new("Frame")
+    altTrack.Position = UDim2.fromOffset(126, 47)
+    altTrack.Size = UDim2.fromOffset(86, 5)
+    altTrack.BackgroundColor3 = Color3.fromRGB(37,42,52)
+    altTrack.BorderSizePixel = 0
+    altTrack.Parent = scorePanel
+    round(altTrack,99)
+    local altFill = Instance.new("Frame")
+    altFill.Size = UDim2.new(clamp(a.alt,0,100)/100,0,1,0)
+    altFill.BackgroundColor3 = COLORS.purple
+    altFill.BorderSizePixel = 0
+    altFill.Parent = altTrack
+    round(altFill,99)
+
+    local metricRow = Instance.new("Frame")
+    metricRow.Position = UDim2.fromOffset(14, 94)
+    metricRow.Size = UDim2.new(1, -28, 0, 38)
+    metricRow.BackgroundTransparency = 1
+    metricRow.Parent = card
+    local ageText = a.ageDays and tostring(a.ageDays) .. "d" or "?"
+    local badgeText = a.badgeAvailable and (tostring(a.badgeCount) .. (a.badgeCapped and "+" or "")) or "?"
+    local values = {
+        {"AGE", ageText, COLORS.text},
+        {"FRIENDS", data.friendCount ~= nil and tostring(data.friendCount) or "?", COLORS.text},
+        {"BADGES", badgeText, COLORS.text},
+        {"FPS HITS", tostring(a.fpsHits), a.fpsHits > 0 and COLORS.blue or COLORS.text},
+        {"GROUPS", data.groupCount ~= nil and tostring(data.groupCount) or "?", COLORS.text},
+        {"AVATAR", data.assetCount ~= nil and tostring(data.assetCount) or "?", COLORS.text},
+    }
+    local chipGap = 6
+    local totalW = 618
+    local chipW = math.floor((totalW - chipGap * 5) / 6)
+    for i, item in ipairs(values) do
+        metricChip(metricRow, (i-1)*(chipW+chipGap), chipW, item[1], item[2], item[3])
+    end
+
+    local signalBox = Instance.new("Frame")
+    signalBox.Position = UDim2.fromOffset(14, 144)
+    signalBox.Size = UDim2.new(1, -28, 0, 48)
+    signalBox.BackgroundColor3 = Color3.fromRGB(15,18,25)
+    signalBox.BorderSizePixel = 0
+    signalBox.Parent = card
+    round(signalBox, 9)
+    local signalText = #a.signals > 0 and table.concat(a.signals, "  •  ") or "No major heuristic signals triggered."
+    local sig = label(signalBox, signalText, 9, Color3.fromRGB(188,197,214), Enum.Font.Gotham)
+    sig.Position = UDim2.fromOffset(10, 5)
+    sig.Size = UDim2.new(1, -20, 1, -10)
+    sig.TextWrapped = true
+    sig.TextYAlignment = Enum.TextYAlignment.Center
+
+    local actionTitle = label(card, "MANUAL TAG", 8, MUTED, Enum.Font.GothamBold)
+    actionTitle.Position = UDim2.fromOffset(14, 206)
+    actionTitle.Size = UDim2.fromOffset(85, 16)
+
+    local function makeTag(text, x, width, color, tagValue)
+        local b = Instance.new("TextButton")
+        b.Position = UDim2.fromOffset(x, 202)
+        b.Size = UDim2.fromOffset(width, 32)
+        b.BackgroundColor3 = color
+        b.Text = text
+        b.TextColor3 = Color3.new(1,1,1)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 9
+        b.AutoButtonColor = false
+        b.Parent = card
+        round(b, 8)
+        buttonFX(b, color, color:Lerp(Color3.new(1,1,1), 0.08))
+        track(b.MouseButton1Click:Connect(function()
+            DB[key] = {
+                username = info.name,
+                displayName = info.displayName,
+                tag = tagValue,
+                lastRisk = a.risk,
+                lastAlt = a.alt,
+                updated = os.time(),
+            }
+            saveDB()
+            seen.Text = "Saved tag: " .. tagValue
+            showToast("Tagged @" .. tostring(info.name) .. " as " .. tagValue, color)
+        end))
+    end
+
+    makeTag("✓ CLEAN", 106, 92, Color3.fromRGB(34, 101, 68), "clean")
+    makeTag("! SUSPICIOUS", 206, 110, Color3.fromRGB(127, 83, 34), "suspicious")
+    makeTag("⚠ CHEATER", 324, 98, Color3.fromRGB(120, 42, 55), "cheater")
+
+    track(card.MouseEnter:Connect(function() tw(card, {BackgroundColor3 = COLORS.cardHover}, 0.14) end))
+    track(card.MouseLeave:Connect(function() tw(card, {BackgroundColor3 = COLORS.card}, 0.14) end))
+end
+
+local SCANNING = false
+
+local function parseNames(text)
+    local out, seen = {}, {}
+    for token in string.gmatch(text or "", "[^,%s]+") do
+        token = trim(token)
+        local low = safeLower(token)
+        if token ~= "" and not seen[low] then
+            seen[low] = true
+            out[#out + 1] = token
+            if #out >= 8 then break end
+        end
+    end
+    return out
+end
+
+local function setScanBusy(on, text)
+    statusDot.BackgroundColor3 = on and COLORS.yellow or COLORS.green
+    scanButton.Text = on and "SCANNING..." or "SCAN"
+    scanButton.Active = not on
+    if text then scanStatus.Text = text end
+end
+
+local function runUsernameScan(names)
+    if SCANNING then return end
+    SCANNING = true
+    clearResults()
+
+    if #names == 0 then
+        setScanBusy(false, "Enter at least one username.")
+        showToast("Enter a username first", COLORS.yellow)
+        SCANNING = false
+        return
+    end
+
+    setScanBusy(true, "Starting scan...")
+    task.spawn(function()
+        for i, username in ipairs(names) do
+            if UNLOADED then break end
+            setScanBusy(true, string.format("Scanning %s  •  %d/%d", username, i, #names))
+            local userId = getUserIdFromUsername(username)
+            if not userId then
+                addErrorCard(username, "Username not found")
+            else
+                local data, err = scanById(userId)
+                if data then addResultCard(data) else addErrorCard(username, err or "Scan failed") end
+            end
+            task.wait(0.12)
+        end
+        setScanBusy(false, "Finished • tags save locally when file APIs are supported")
+        showToast("Scan finished", COLORS.green)
+        SCANNING = false
+    end)
+end
+
+track(scanButton.MouseButton1Click:Connect(function()
+    runUsernameScan(parseNames(input.Text))
+end))
+
+track(input.FocusLost:Connect(function(enterPressed)
+    if enterPressed then runUsernameScan(parseNames(input.Text)) end
+end))
+
+track(lobbyButton.MouseButton1Click:Connect(function()
+    if SCANNING then return end
+    local names = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            names[#names + 1] = plr.Name
+            if #names >= 8 then break end
+        end
+    end
+    if #names == 0 then names[1] = LocalPlayer.Name end
+    input.Text = table.concat(names, ", ")
+    showToast("Loaded lobby usernames", COLORS.purple)
+    runUsernameScan(names)
+end))
+
+--------------------------------------------------
+-- PERFORMANCE PAGE
+--------------------------------------------------
+local perfHeading = label(perfPage, "Performance Control", 19, COLORS.text, Enum.Font.GothamBold)
+perfHeading.Position = UDim2.fromOffset(22, 18)
+perfHeading.Size = UDim2.fromOffset(320, 26)
+local perfDesc = label(perfPage, "Client-side visual controls and frame-rate tools.", 10, COLORS.sub, Enum.Font.Gotham)
+perfDesc.Position = UDim2.fromOffset(22, 45)
+perfDesc.Size = UDim2.fromOffset(440, 18)
+
+local perfHero = Instance.new("Frame")
+perfHero.Position = UDim2.fromOffset(22, 76)
+perfHero.Size = UDim2.new(1, -44, 0, 94)
+perfHero.BackgroundColor3 = Color3.fromRGB(21, 26, 37)
+perfHero.BorderSizePixel = 0
+perfHero.Parent = perfPage
+round(perfHero, 14)
+stroke(perfHero, Color3.fromRGB(57,68,89), 1, 0.25)
+gradient(perfHero, Color3.fromRGB(25,32,47), Color3.fromRGB(19,23,32), 0)
+
+local heroIcon = Instance.new("Frame")
+heroIcon.Size = UDim2.fromOffset(52,52)
+heroIcon.Position = UDim2.fromOffset(16,21)
+heroIcon.BackgroundColor3 = ACCENT
+heroIcon.BorderSizePixel = 0
+heroIcon.Parent = perfHero
+round(heroIcon, 13)
+gradient(heroIcon, ACCENT, ACCENT2, 30)
+local heroBolt = label(heroIcon, "⚡", 22, Color3.new(1,1,1), Enum.Font.GothamBold)
+heroBolt.Size = UDim2.fromScale(1,1)
+heroBolt.TextXAlignment = Enum.TextXAlignment.Center
+
+local heroTitle = label(perfHero, "Optimization Suite", 13, COLORS.text, Enum.Font.GothamBold)
+heroTitle.Position = UDim2.fromOffset(82, 18)
+heroTitle.Size = UDim2.fromOffset(250, 20)
+local heroSub = label(perfHero, "Toggle individual render costs or use Potato Mode.", 9, COLORS.sub, Enum.Font.Gotham)
+heroSub.Position = UDim2.fromOffset(82, 39)
+heroSub.Size = UDim2.fromOffset(365, 18)
+local heroWarn = label(perfHero, "9999 is a target cap; actual FPS depends on your system.", 8, MUTED, Enum.Font.Gotham)
+heroWarn.Position = UDim2.fromOffset(82, 60)
+heroWarn.Size = UDim2.fromOffset(390, 16)
+
+local capStatus = Instance.new("TextLabel")
+capStatus.Size = UDim2.fromOffset(118,30)
+capStatus.Position = UDim2.new(1,-134,0,32)
+capStatus.BackgroundColor3 = Color3.fromRGB(16,20,27)
+capStatus.Text = "CAP  •  240"
+capStatus.TextColor3 = COLORS.sub
+capStatus.TextSize = 9
+capStatus.Font = Enum.Font.GothamBold
+capStatus.Parent = perfHero
+round(capStatus,99)
+stroke(capStatus, Color3.fromRGB(56,67,86),1,0.35)
+
+local perfScroll = Instance.new("ScrollingFrame")
+perfScroll.Position = UDim2.fromOffset(22, 184)
+perfScroll.Size = UDim2.new(1, -44, 1, -202)
+perfScroll.BackgroundTransparency = 1
+perfScroll.BorderSizePixel = 0
+perfScroll.ScrollBarThickness = 3
+perfScroll.ScrollBarImageColor3 = Color3.fromRGB(66, 77, 98)
+perfScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+perfScroll.CanvasSize = UDim2.new()
+perfScroll.Parent = perfPage
+
+local perfLayout = Instance.new("UIListLayout")
+perfLayout.Padding = UDim.new(0, 10)
+perfLayout.Parent = perfScroll
+
+local function section(text)
+    local l = label(perfScroll, string.upper(text), 9, MUTED, Enum.Font.GothamBold)
+    l.Size = UDim2.new(1, -4, 0, 22)
+    return l
+end
+
+local toggleRefreshers = {}
+
+local function makeToggle(icon, titleText, descText, stateKey, setter, tint)
+    local row = Instance.new("TextButton")
+    row.Size = UDim2.new(1, -4, 0, 68)
+    row.BackgroundColor3 = COLORS.card
+    row.Text = ""
+    row.AutoButtonColor = false
+    row.Parent = perfScroll
+    round(row, 12)
+    stroke(row, Color3.fromRGB(50,59,75), 1, 0.34)
+
+    local iconBox = Instance.new("Frame")
+    iconBox.Size = UDim2.fromOffset(38,38)
+    iconBox.Position = UDim2.fromOffset(12,15)
+    iconBox.BackgroundColor3 = Color3.fromRGB(29,34,46)
+    iconBox.BorderSizePixel = 0
+    iconBox.Parent = row
+    round(iconBox,10)
+    local ic = label(iconBox, icon, 16, tint or COLORS.blue, Enum.Font.GothamBold)
+    ic.Size = UDim2.fromScale(1,1)
+    ic.TextXAlignment = Enum.TextXAlignment.Center
+
+    local t = label(row, titleText, 12, COLORS.text, Enum.Font.GothamSemibold)
+    t.Position = UDim2.fromOffset(62, 12)
+    t.Size = UDim2.new(1, -160, 0, 20)
+    local d = label(row, descText, 9, COLORS.sub, Enum.Font.Gotham)
+    d.Position = UDim2.fromOffset(62, 34)
+    d.Size = UDim2.new(1, -160, 0, 18)
+
+    local stateText = label(row, "OFF", 8, MUTED, Enum.Font.GothamBold)
+    stateText.Position = UDim2.new(1, -116, 0, 25)
+    stateText.Size = UDim2.fromOffset(38,18)
+    stateText.TextXAlignment = Enum.TextXAlignment.Right
+
+    local sw = Instance.new("Frame")
+    sw.Size = UDim2.fromOffset(48, 26)
+    sw.Position = UDim2.new(1, -62, 0.5, -13)
+    sw.BackgroundColor3 = Color3.fromRGB(58, 65, 78)
+    sw.BorderSizePixel = 0
+    sw.Parent = row
+    round(sw, 99)
+
+    local dot = Instance.new("Frame")
+    dot.Size = UDim2.fromOffset(20, 20)
+    dot.Position = UDim2.fromOffset(3, 3)
+    dot.BackgroundColor3 = Color3.fromRGB(230, 233, 240)
+    dot.BorderSizePixel = 0
+    dot.Parent = sw
+    round(dot, 99)
+
+    local function refresh()
+        local on = PERF[stateKey]
+        tw(sw, {BackgroundColor3 = on and (tint or COLORS.green) or Color3.fromRGB(58,65,78)}, 0.14)
+        tw(dot, {Position = on and UDim2.fromOffset(25,3) or UDim2.fromOffset(3,3)}, 0.14)
+        stateText.Text = on and "ON" or "OFF"
+        stateText.TextColor3 = on and (tint or COLORS.green) or MUTED
+        if stateKey == "FPSCap" then
+            capStatus.Text = on and "CAP  •  9999" or "CAP  •  240"
+            capStatus.TextColor3 = on and COLORS.green or COLORS.sub
+        end
+    end
+    toggleRefreshers[#toggleRefreshers + 1] = refresh
+
+    track(row.MouseEnter:Connect(function() tw(row, {BackgroundColor3 = COLORS.cardHover}, 0.12) end))
+    track(row.MouseLeave:Connect(function() tw(row, {BackgroundColor3 = COLORS.card}, 0.12) end))
+    track(row.MouseButton1Click:Connect(function()
+        local target = not PERF[stateKey]
+        local ok = setter(target)
+        if ok == false then
+            target = false
+            if stateKey == "FPSCap" then showToast("setfpscap is not supported here", COLORS.red) end
+        else
+            showToast(titleText .. (target and " enabled" or " disabled"), target and COLORS.green or COLORS.sub)
+        end
+        refresh()
+        if stateKey == "Potato" then
+            for _, fn in ipairs(toggleRefreshers) do fn() end
+        end
+    end))
+    refresh()
+end
+
+section("Quick Boost")
+makeToggle("∞", "FPS Cap 9999", "Attempts setfpscap(9999) when your environment provides it.", "FPSCap", setFPSCap, COLORS.green)
+makeToggle("🥔", "Potato Mode", "Enable every visual optimization in one click.", "Potato", setPotato, COLORS.orange)
+
+section("Graphics")
+makeToggle("▧", "Strip Textures", "Hide decals/textures and clear mesh or surface maps.", "Textures", setTextures, COLORS.blue)
+makeToggle("◆", "Simple Materials", "Force BaseParts to SmoothPlastic and remove reflectance.", "Materials", setMaterials, Color3.fromRGB(91,201,214))
+makeToggle("✦", "Remove Particles", "Disable particles, trails, beams, smoke, fire and sparkles.", "Particles", setParticles, COLORS.purple)
+makeToggle("◐", "Remove Shadows", "Disable global lighting shadows and per-part shadows.", "Shadows", setShadows, Color3.fromRGB(155,171,199))
+makeToggle("◉", "Remove Post FX", "Disable bloom, blur, DOF, sun rays and color correction.", "PostFX", setPostFX, COLORS.yellow)
+makeToggle("☁", "Remove Atmosphere", "Remove atmosphere density, haze and cloud rendering.", "Atmosphere", setAtmosphere, Color3.fromRGB(110,187,255))
+
+section("Actions")
+local restoreBtn = Instance.new("TextButton")
+restoreBtn.Size = UDim2.new(1, -4, 0, 48)
+restoreBtn.BackgroundColor3 = Color3.fromRGB(29, 50, 86)
+restoreBtn.Text = "↻   RESTORE ALL VISUALS"
+restoreBtn.TextColor3 = Color3.fromRGB(178, 207, 255)
+restoreBtn.Font = Enum.Font.GothamBold
+restoreBtn.TextSize = 10
+restoreBtn.AutoButtonColor = false
+restoreBtn.Parent = perfScroll
+round(restoreBtn, 11)
+stroke(restoreBtn, Color3.fromRGB(62, 99, 158), 1, 0.25)
+buttonFX(restoreBtn, Color3.fromRGB(29,50,86), Color3.fromRGB(35,60,102))
+track(restoreBtn.MouseButton1Click:Connect(function()
+    restorePerformance()
+    for _, fn in ipairs(toggleRefreshers) do fn() end
+    showToast("Visual settings restored", COLORS.blue)
+end))
+
+--------------------------------------------------
+-- HEADER HIDE BUTTON
+--------------------------------------------------
+track(hideBtn.MouseButton1Click:Connect(function()
+    main.Visible = false
+    shadow.Visible = false
+end))
+
+
+--------------------------------------------------
+-- AUTO APPLY PERFORMANCE TO NEW OBJECTS
+--------------------------------------------------
+track(workspace.DescendantAdded:Connect(function(obj)
+    if UNLOADED then return end
+    task.defer(function()
+        if PERF.Textures then stripTextureObject(obj) end
+        if PERF.Materials then stripMaterialObject(obj) end
+        if PERF.Particles then stripParticleObject(obj) end
+        if PERF.Shadows then stripShadowObject(obj) end
+        if PERF.Atmosphere then stripAtmosObject(obj) end
+    end)
+end))
+
+track(Lighting.DescendantAdded:Connect(function(obj)
+    if UNLOADED then return end
+    task.defer(function()
+        if PERF.PostFX then stripPostObject(obj) end
+        if PERF.Atmosphere then stripAtmosObject(obj) end
+    end)
+end))
+
+--------------------------------------------------
+-- FORCE HIGH GUI Z-ORDER
+--------------------------------------------------
+-- Roblox's own menu is a CoreGui layer. These values keep every object in this
+-- panel at the highest normal GUI order available to the runtime. The hidden
+-- OnTopOfCoreBlur property above is what may allow it to remain above ESC blur
+-- on executor environments that support that behavior.
+local function boostGuiZIndex(root, base)
+    for _, obj in ipairs(root:GetDescendants()) do
+        if obj:IsA("GuiObject") then
+            local oldZ = obj.ZIndex
+            pcall(function()
+                obj.ZIndex = base + math.clamp(oldZ, 0, 999)
+            end)
+        end
+    end
+end
+
+pcall(function()
+    shadow.ZIndex = 999998
+    main.ZIndex = 999999
+    boostGuiZIndex(main, 1000000)
+end)
+
+--------------------------------------------------
+-- FPS COUNTER
+--------------------------------------------------
+local frameCount = 0
+local lastFPS = os.clock()
+track(RunService.RenderStepped:Connect(function()
+    if UNLOADED then return end
+    frameCount += 1
+    local now = os.clock()
+    local diff = now - lastFPS
+    if diff >= 0.5 then
+        local fps = math.floor(frameCount / diff)
+        fpsBadge.Text = "FPS " .. fps
+        local fpsColor = fps >= 120 and COLORS.green or (fps >= 60 and COLORS.yellow or COLORS.red)
+        fpsBadge.TextColor3 = fpsColor
+        fpsDot.BackgroundColor3 = fpsColor
+        frameCount = 0
+        lastFPS = now
+    end
+end))
+
+--------------------------------------------------
+-- DRAGGING
+--------------------------------------------------
+local dragging = false
+local dragStart
+local startPos
+local shadowStartPos
+
+track(header.InputBegan:Connect(function(inputObj)
+    if inputObj.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = inputObj.Position
+        startPos = main.Position
+        shadowStartPos = shadow.Position
+    end
+end))
+
+track(UserInputService.InputChanged:Connect(function(inputObj)
+    if dragging and inputObj.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = inputObj.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + delta.X,
+            startPos.Y.Scale, startPos.Y.Offset + delta.Y
+        )
+        shadow.Position = UDim2.new(
+            shadowStartPos.X.Scale, shadowStartPos.X.Offset + delta.X,
+            shadowStartPos.Y.Scale, shadowStartPos.Y.Offset + delta.Y
+        )
+    end
+end))
+
+track(UserInputService.InputEnded:Connect(function(inputObj)
+    if inputObj.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = false
+    end
+end))
+
+--------------------------------------------------
+-- RIGHT SHIFT HIDE/SHOW
+--------------------------------------------------
+track(UserInputService.InputBegan:Connect(function(inputObj, processed)
+    if processed or UNLOADED then return end
+    if inputObj.KeyCode == Enum.KeyCode.RightShift then
+        local visible = not main.Visible
+        main.Visible = visible
+        shadow.Visible = visible
+    end
+end))
+
+--------------------------------------------------
+-- UNLOAD
+--------------------------------------------------
+track(unload.MouseButton1Click:Connect(function()
+    if UNLOADED then return end
+    UNLOADED = true
+
+    restorePerformance()
+    setFPSCap(false)
+    saveDB()
+
+    for _, conn in ipairs(CONNECTIONS) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(CONNECTIONS)
+
+    if gui then gui:Destroy() end
+    print("[OP1] Unloaded")
+end))
+
+print("[OP1] Mega Checker loaded")
+print("[OP1] RightShift = hide/show")
