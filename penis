@@ -683,8 +683,25 @@ end
 --------------------------------------------------
 -- CLEAN OLD UI
 --------------------------------------------------
-local old = PlayerGui:FindFirstChild(APP_NAME)
-if old then old:Destroy() end
+-- Clean previous copies from every UI container we can safely access.
+local function destroyOldGui(parent)
+    if not parent then return end
+    pcall(function()
+        local old = parent:FindFirstChild(APP_NAME)
+        if old then old:Destroy() end
+    end)
+end
+
+destroyOldGui(PlayerGui)
+
+local CoreGui = game:GetService("CoreGui")
+destroyOldGui(CoreGui)
+
+pcall(function()
+    if typeof(gethui) == "function" then
+        destroyOldGui(gethui())
+    end
+end)
 
 --------------------------------------------------
 -- PREMIUM UI SYSTEM
@@ -752,8 +769,6 @@ end
 --------------------------------------------------
 -- ROOT / BACKDROP
 --------------------------------------------------
-local CoreGui = game:GetService("CoreGui")
-
 local gui = Instance.new("ScreenGui")
 gui.Name = APP_NAME
 gui.ResetOnSpawn = false
@@ -761,7 +776,8 @@ gui.IgnoreGuiInset = true
 gui.DisplayOrder = 2147483647
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
 
--- Use the full screen where the runtime supports these newer ScreenGui properties.
+-- Optional newer ScreenGui properties. They are wrapped so older runtimes
+-- cannot stop the entire script from loading.
 pcall(function()
     gui.ScreenInsets = Enum.ScreenInsets.None
 end)
@@ -770,35 +786,57 @@ pcall(function()
     gui.ClipToDeviceSafeArea = false
 end)
 
--- Prefer an executor hidden-UI container. CoreGui is the fallback.
-local guiParent = CoreGui
-pcall(function()
-    if gethui then
-        local hidden = gethui()
-        if hidden then
-            guiParent = hidden
-        end
-    end
-end)
-
--- Protect the GUI on runtimes that expose the Synapse-style helper.
+-- Protect the GUI when the runtime exposes a Synapse-style helper.
 pcall(function()
     if syn and syn.protect_gui then
         syn.protect_gui(gui)
     end
 end)
 
--- Some executor runtimes expose this as a hidden ScreenGui property.
--- sethiddenproperty is tried first because direct assignment may be blocked.
+-- Some runtimes expose this hidden property. Failure here is harmless.
 pcall(function()
-    if sethiddenproperty then
+    if typeof(sethiddenproperty) == "function" then
         sethiddenproperty(gui, "OnTopOfCoreBlur", true)
-    else
-        gui.OnTopOfCoreBlur = true
     end
 end)
 
-gui.Parent = guiParent
+-- Try hidden UI first. If the runtime refuses that parent, try CoreGui.
+-- If CoreGui is also blocked, fall back to PlayerGui so the panel still loads.
+local parentCandidates = {}
+
+pcall(function()
+    if typeof(gethui) == "function" then
+        local hidden = gethui()
+        if hidden then
+            parentCandidates[#parentCandidates + 1] = hidden
+        end
+    end
+end)
+
+parentCandidates[#parentCandidates + 1] = CoreGui
+parentCandidates[#parentCandidates + 1] = PlayerGui
+
+local parented = false
+local parentName = "none"
+
+for _, candidate in ipairs(parentCandidates) do
+    if not parented and candidate then
+        local ok = pcall(function()
+            gui.Parent = candidate
+        end)
+
+        if ok and gui.Parent == candidate then
+            parented = true
+            parentName = candidate:GetFullName()
+        end
+    end
+end
+
+if not parented then
+    error("OP1 UI could not be parented to gethui, CoreGui, or PlayerGui")
+end
+
+print("[OP1] GUI parent: " .. parentName)
 
 local shadow = Instance.new("Frame")
 shadow.Name = "Shadow"
